@@ -1,4 +1,4 @@
-import { getApiKey, groqClient, LLM_MODEL, missingKeyResponse } from "@/lib/groq";
+import { errorResponse, getApiKey, groqClient, LLM_MODEL, missingKeyResponse } from "@/lib/groq";
 
 export const runtime = "nodejs";
 export const maxDuration = 60;
@@ -60,7 +60,6 @@ export async function POST(req: Request) {
       headers: { "Content-Type": "text/plain; charset=utf-8" },
     });
   } catch (err) {
-    const message = err instanceof Error ? err.message : "Expand failed";
-    return Response.json({ error: message }, { status: 500 });
+    return errorResponse(err, "Expand failed");
   }
 }

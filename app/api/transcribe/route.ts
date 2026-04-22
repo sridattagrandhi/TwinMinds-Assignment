@@ -1,4 +1,4 @@
-import { getApiKey, groqClient, missingKeyResponse, TRANSCRIBE_MODEL } from "@/lib/groq";
+import { errorResponse, getApiKey, groqClient, missingKeyResponse, TRANSCRIBE_MODEL } from "@/lib/groq";
 
 export const runtime = "nodejs";
 export const maxDuration = 60;
@@ -28,7 +28,6 @@ export async function POST(req: Request) {
     const text = typeof result === "string" ? result : (result as { text?: string }).text ?? "";
     return Response.json({ text: text.trim() });
   } catch (err) {
-    const message = err instanceof Error ? err.message : "Transcription failed";
-    return Response.json({ error: message }, { status: 500 });
+    return errorResponse(err, "Transcription failed");
   }
 }

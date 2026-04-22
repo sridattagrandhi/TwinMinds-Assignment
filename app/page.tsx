@@ -10,6 +10,7 @@ import {
   fetchSuggestions,
   streamChat,
   streamExpand,
+  summarizeTranscript,
   transcribeChunk,
 } from "@/lib/api";
 import { previousPreviews, transcriptWindow } from "@/lib/context";
@@ -37,11 +38,18 @@ export default function Home() {
   const recorderRef = useRef<ChunkedRecorder | null>(null);
   const lastSuggestAtRef = useRef<number>(0);
   const [transcribingCount, setTranscribingCount] = useState(0);
+  // Index (exclusive) of the last transcript chunk folded into rollingSummary.
+  const summarizedUpToRef = useRef<number>(0);
+  const summarizingRef = useRef<boolean>(false);
 
   const sessionRef = useRef(session);
-  sessionRef.current = session;
   const settingsRef = useRef(settings);
-  settingsRef.current = settings;
+  useEffect(() => {
+    sessionRef.current = session;
+  }, [session]);
+  useEffect(() => {
+    settingsRef.current = settings;
+  }, [settings]);
 
   const runSuggest = useCallback(async () => {
     const s = settingsRef.current;
@@ -85,7 +93,7 @@ export default function Home() {
       useSession.getState().addBatch(batch);
       lastSuggestAtRef.current = Date.now();
     } catch (e) {
-      setError(e instanceof Error ? e.message : String(e));
+      setError(friendlyApiError(e));
     } finally {
       setSuggestLoading(false);
     }
@@ -109,7 +117,7 @@ export default function Home() {
       });
       if (text) useSession.getState().addChunk(text);
     } catch (e) {
-      setError(e instanceof Error ? e.message : String(e));
+      setError(friendlyApiError(e));
     } finally {
       setTranscribingCount((n) => Math.max(0, n - 1));
     }
@@ -130,33 +138,21 @@ export default function Home() {
       lastSuggestAtRef.current = Date.now();
       useSession.getState().startSession();
     } catch (e) {
-      setError(e instanceof Error ? e.message : String(e));
+      setError(friendlyMicError(e));
     }
   }, [handleChunk]);
 
-  // Manual refresh: if recording, force the current audio chunk to flush
-  // through transcription first, then fire a suggest batch. When not
-  // recording, just run suggest over whatever we have.
+  // Manual refresh: suggest immediately over whatever transcript we already
+  // have (low latency), and kick off an audio flush in the background so the
+  // next auto-suggest sees fresher context.
   const onManualRefresh = useCallback(async () => {
     if (recorderRef.current && sessionRef.current.isRecording) {
-      const transcribedBefore = transcribingCount;
-      const chunkCountBefore = sessionRef.current.transcript.length;
       recorderRef.current.flush();
-      // Wait for the flushed chunk to be transcribed (appears as a new chunk
-      // in the transcript). Give up after 10s either way.
-      const start = Date.now();
-      while (Date.now() - start < 10000) {
-        await new Promise((r) => setTimeout(r, 150));
-        const latestCount = useSession.getState().transcript.length;
-        if (latestCount > chunkCountBefore) break;
-        // Also break if no transcription is in flight (flush produced silence).
-        if (transcribedBefore === 0 && transcribingCount === 0 && Date.now() - start > 2000) {
-          break;
-        }
-      }
     }
+    const t0 = performance.now();
     await runSuggest();
-  }, [runSuggest, transcribingCount]);
+    console.info(`[latency] refresh→rendered: ${Math.round(performance.now() - t0)}ms`);
+  }, [runSuggest]);
 
   const stopRecording = useCallback(async () => {
     if (recorderRef.current) {
@@ -178,6 +174,46 @@ export default function Home() {
     if (Date.now() - lastSuggestAtRef.current < intervalMs) return;
     void runSuggest();
   }, [latestChunkTs, session.isRecording, settings.refreshIntervalSec, runSuggest]);
+
+  // Long-session memory: once the transcript grows past what fits in the live
+  // window, fold the older chunks into rollingSummary so suggest still sees
+  // that context. Leaves the last ~12 chunks in the live window.
+  const transcriptLen = useSession((s) => s.transcript.length);
+  useEffect(() => {
+    const KEEP_LIVE = 12;
+    const BATCH = 15;
+    if (summarizingRef.current) return;
+    const eligible = transcriptLen - KEEP_LIVE;
+    if (eligible - summarizedUpToRef.current < BATCH) return;
+    const apiKey = settingsRef.current.apiKey;
+    if (!apiKey) return;
+    summarizingRef.current = true;
+    (async () => {
+      const sess = sessionRef.current;
+      const from = summarizedUpToRef.current;
+      const to = sess.transcript.length - KEEP_LIVE;
+      if (to <= from) {
+        summarizingRef.current = false;
+        return;
+      }
+      const slice = sess.transcript.slice(from, to).map((c) => c.text).join(" ");
+      try {
+        const summary = await summarizeTranscript({
+          apiKey,
+          priorSummary: sess.rollingSummary,
+          transcript: slice,
+          meetingType: sess.meetingType,
+        });
+        if (summary) useSession.getState().setRollingSummary(summary);
+        summarizedUpToRef.current = to;
+      } catch (e) {
+        // Non-fatal: suggest still works without a fresh summary.
+        console.warn("summarize failed", e);
+      } finally {
+        summarizingRef.current = false;
+      }
+    })();
+  }, [transcriptLen]);
 
   const onClickSuggestion = useCallback(
     async (batch: SuggestionBatch, s: Suggestion) => {
@@ -205,6 +241,8 @@ export default function Home() {
       });
 
       setChatStreaming(true);
+      const t0 = performance.now();
+      let firstToken = true;
       try {
         const transcript = transcriptWindow(
           sessionRef.current.transcript,
@@ -222,7 +260,15 @@ export default function Home() {
               detail_seed: s.detail_seed,
             },
           },
-          (delta) => useSession.getState().appendToChatMessage(asstId, delta),
+          (delta) => {
+            if (firstToken) {
+              firstToken = false;
+              console.info(
+                `[latency] expand→first token: ${Math.round(performance.now() - t0)}ms`,
+              );
+            }
+            useSession.getState().appendToChatMessage(asstId, delta);
+          },
         );
       } catch (e) {
         useSession
@@ -259,6 +305,8 @@ export default function Home() {
       timestamp: Date.now(),
     });
     setChatStreaming(true);
+    const t0 = performance.now();
+    let firstToken = true;
     try {
       const transcript = transcriptWindow(
         sessionRef.current.transcript,
@@ -276,7 +324,15 @@ export default function Home() {
           meetingType: sessionRef.current.meetingType,
           history,
         },
-        (delta) => useSession.getState().appendToChatMessage(asstId, delta),
+        (delta) => {
+          if (firstToken) {
+            firstToken = false;
+            console.info(
+              `[latency] chat→first token: ${Math.round(performance.now() - t0)}ms`,
+            );
+          }
+          useSession.getState().appendToChatMessage(asstId, delta);
+        },
       );
     } catch (e) {
       useSession
@@ -309,6 +365,8 @@ export default function Home() {
     if (session.isRecording) return;
     if (confirm("Clear this session? Transcript, suggestions, and chat will be erased.")) {
       useSession.getState().reset();
+      summarizedUpToRef.current = 0;
+      lastSuggestAtRef.current = 0;
     }
   };
 
@@ -460,4 +518,29 @@ function IconButton({
       {children}
     </button>
   );
+}
+
+function friendlyMicError(e: unknown): string {
+  const err = e as { name?: string; message?: string };
+  if (err?.name === "NotAllowedError" || err?.name === "SecurityError") {
+    return "Microphone permission denied. Allow mic access in your browser, then click Start again.";
+  }
+  if (err?.name === "NotFoundError" || err?.name === "OverconstrainedError") {
+    return "No microphone found. Plug one in or pick a different input device.";
+  }
+  return err?.message || "Couldn't start the microphone.";
+}
+
+// Translate messages thrown by lib/api.ts (which carry the server's error
+// string verbatim) into something a user can act on.
+function friendlyApiError(e: unknown): string {
+  const msg = e instanceof Error ? e.message : String(e);
+  const low = msg.toLowerCase();
+  if (low.includes("401") || low.includes("invalid_api_key") || low.includes("invalid api key")) {
+    return "Groq rejected the API key. Double-check it in Settings.";
+  }
+  if (low.includes("429") || low.includes("rate") || low.includes("quota")) {
+    return "Groq rate-limited this request. Wait a moment and try again.";
+  }
+  return msg;
 }

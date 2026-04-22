@@ -93,6 +93,29 @@ export async function streamExpand(
   await readStream(res, onDelta);
 }
 
+export async function summarizeTranscript(args: {
+  apiKey: string;
+  priorSummary: string;
+  transcript: string;
+  meetingType: string | null;
+}): Promise<string> {
+  const res = await fetch("/api/summarize", {
+    method: "POST",
+    headers: { ...authHeaders(args.apiKey), "Content-Type": "application/json" },
+    body: JSON.stringify({
+      priorSummary: args.priorSummary,
+      transcript: args.transcript,
+      meetingType: args.meetingType,
+    }),
+  });
+  if (!res.ok) {
+    const { error } = await res.json().catch(() => ({ error: res.statusText }));
+    throw new Error(error || "Summarize failed");
+  }
+  const { summary } = await res.json();
+  return summary || "";
+}
+
 export async function streamChat(
   args: {
     apiKey: string;

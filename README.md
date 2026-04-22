@@ -1,112 +1,171 @@
 # TwinMind · Live Suggestions
 
-A real-time meeting copilot: listens to live mic audio, transcribes every ~30s, and surfaces 3 fresh, contextual suggestions per batch. Click any card to get a detailed answer streamed into the chat panel. Built on Groq (Whisper Large V3 + GPT-OSS 120B).
+A browser-based real-time meeting copilot. It listens to your mic, transcribes
+the conversation with Whisper, and every ~30 seconds surfaces 3 suggestion
+cards (questions to ask, talking points, fact-checks, clarifications, answers,
+or definitions). Tap a card to drop it into the chat panel, where a streamed
+detailed answer picks up where the card left off. You can also chat freely at
+any time — the assistant has the full transcript as context.
 
-## Stack
+**Deployed:** _set after Vercel deploy_ → `https://<your-project>.vercel.app`
 
-- **Next.js 16 (App Router) + React 19 + Tailwind v4** — single repo, deployed on Vercel.
-- **Zustand** for in-memory session state; `persist` middleware for settings in `localStorage`.
-- **Groq SDK** server-side via Next.js Route Handlers (`/api/transcribe`, `/api/suggest`, `/api/expand`, `/api/chat`).
-- **MediaRecorder** for chunked audio capture (one standalone WebM/Opus file per chunk).
-- **Token streaming** for expand + chat via a plain `ReadableStream` response.
+## What it does
 
-## Running locally
-
-```bash
-npm install
-npm run dev
-```
-
-Open http://localhost:3000, click **Settings**, paste a Groq API key from https://console.groq.com, then hit **Start mic**.
-
-The API key never leaves the user's browser except as an `x-groq-key` header to this app's own API routes, which forward it to Groq. Nothing is persisted server-side.
+- **Mic capture** in fixed-length WebM/Opus chunks (default 8s) via
+  `MediaRecorder`, stopping and restarting each chunk so every blob is a
+  standalone file Whisper can accept.
+- **Transcription** through Groq's Whisper Large V3. Each call passes the tail
+  of the running transcript as a `prompt` so proper nouns and vocabulary carry
+  across chunks, plus `language: "en"` to stop Whisper from hallucinating a
+  foreign language on near-silence.
+- **Suggestions** from Groq's `openai/gpt-oss-120b` in JSON mode. The prompt
+  enforces 3 mixed-type suggestions per batch, bans repeats of the previous
+  two batches, and returns `insufficient_signal: true` to skip batches when
+  the transcript is filler — so the user never sees filler cards.
+- **Rolling summary** kicks in once the transcript outgrows the live window.
+  Older chunks are compressed into a bulleted summary that is re-fed into
+  every subsequent suggest call, so long meetings keep long-horizon context.
+- **Streaming expand & chat** via a single `ReadableStream` per response;
+  the first token is typically on screen in well under a second.
+- **BYO key.** No keys on the server. The user pastes a Groq API key into
+  Settings, it lives in `localStorage`, and is forwarded on each request as
+  an `x-groq-key` header. Route handlers read that header and nothing else.
+- **Export.** One click produces a timestamped JSON file with the full
+  transcript, all suggestion batches (including which ones were clicked), and
+  the chat history.
 
 ## Architecture
 
 ```
- Browser (client)                          Next.js Route Handlers (Node runtime)
- ─────────────────────                     ─────────────────────────────────────
- MediaRecorder ──30s chunks──▶  POST /api/transcribe  ──▶ Groq Whisper Large V3
-        │                                                        │
-        ▼                                                         ▼
- Zustand session store ◀──────── transcript chunk (text) ◀────────┘
-        │
-        │ (every 30s if new transcript)
-        ▼
- POST /api/suggest  ──▶ Groq GPT-OSS 120B (JSON mode)
-        │
-        ▼
- Batch of 3 suggestions prepended in UI.
-
- Click card  ──▶  POST /api/expand  ──stream──▶  Chat panel
- Type in chat ──▶  POST /api/chat    ──stream──▶  Chat panel
+Browser                                Next.js Route Handlers         Groq
+───────────                            ──────────────────────         ────
+MediaRecorder ──8s blob──▶ /api/transcribe ────────────────▶ whisper-large-v3
+                                                │
+Zustand store ◀──text─────────────────── JSON   │
+      │                                         │
+      ├── every ~30s ──▶ /api/suggest ──────────▶ gpt-oss-120b (JSON mode)
+      │                                         │
+      ├── click card ──▶ /api/expand  ──stream──▶ gpt-oss-120b (streaming)
+      │                                         │
+      ├── send chat ───▶ /api/chat    ──stream──▶ gpt-oss-120b (streaming)
+      │                                         │
+      └── transcript > live window ──▶ /api/summarize ─▶ gpt-oss-120b
 ```
 
-## Prompt strategy
+Why this shape:
 
-Everything lives in [lib/prompts.ts](lib/prompts.ts) and is user-editable from the Settings modal.
+- **Route handlers, not edge.** `runtime = "nodejs"` so the Groq SDK works
+  without bundling headaches. The handlers are thin — auth-header check,
+  request assembly, one Groq call, return.
+- **Single source of truth in Zustand.** One in-memory session store
+  (transcript, batches, chat, meeting type, rolling summary) and one
+  persisted settings store (`version: 2` with a `merge` function so adding
+  fields to `DEFAULT_SETTINGS` doesn't break old localStorage state).
+- **Reactive suggest trigger, not `setInterval`.** A `useEffect` watches the
+  latest transcript-chunk timestamp and fires a suggest once the refresh
+  interval has elapsed. Avoids race conditions `setInterval` had with React
+  19 re-renders.
+- **Manual refresh is non-blocking.** The button fires `runSuggest()` against
+  whatever transcript is already in the store and kicks off
+  `recorder.flush()` in the background; the freshly-transcribed chunk lands
+  before the next auto-pass rather than blocking this click.
 
-### Live suggestion prompt (the core of the assignment)
+## Prompt engineering (the interesting part)
 
-For every batch we send the model:
+The suggest prompt does a few things worth calling out:
 
-1. **`MEETING_TYPE`** — classified on early batches (sales_call, job_interview, standup, lecture, brainstorm, one_on_one, customer_support) and reused thereafter to bias the mix.
-2. **`PRIOR_SUMMARY`** — a rolling compression of the meeting so far. Keeps prompt size bounded on long meetings. (Wired through; auto-compression is a next add.)
-3. **`RECENT_TRANSCRIPT`** — a sliding window over the last N minutes (configurable; default 3).
-4. **`PREVIOUS_PREVIEWS`** — the preview text of the last two batches. The model is explicitly told not to repeat or paraphrase them.
+1. **Mixed types enforced.** "Return EXACTLY 3 suggestions, each a different
+   type when possible. Never 3 of the same type." Paired with per-type
+   guidance so the model knows when to pick `fact_check` (a numeric/named
+   claim just landed) vs `answer` (a question just got asked).
+2. **Preview stands alone.** The preview *is* the value. No "click to learn
+   more" — every card is usable without expanding it.
+3. **No-repeat.** The previous 1–2 batches' previews are passed in as
+   `PREVIOUS_PREVIEWS` and the prompt explicitly bans near-duplicates.
+4. **Insufficient-signal escape hatch.** If the recent transcript is silence,
+   filler, or greetings, the model returns `{"insufficient_signal": true}`
+   and the client quietly skips the batch. No garbage cards.
+5. **Meeting type.** Classified once, then fed back in every call so the
+   model stays in the right mode (sales call vs interview vs lecture).
+6. **Rolling summary for long sessions.** Once the live window fills,
+   `/api/summarize` compresses older chunks into a bulleted summary that is
+   persisted in the session store and re-passed to every later suggest.
 
-Hard rules enforced in the system prompt:
+The expand/chat prompts enforce short, scannable, grounded answers — no
+preamble, no "great question", admit uncertainty rather than fabricate.
 
-- **Exactly 3 suggestions, mixed types.** Types: `question`, `talking_point`, `answer`, `fact_check`, `clarification`, `definition`.
-- **Previews must stand alone.** No "click to learn more" — the card text is the value.
-- **Fact-check bias on concrete claims** (numbers, names, dates). Real-time verification is the highest-leverage use case.
-- **`insufficient_signal` escape hatch.** If the last 30s is silence/filler, the model returns `{"insufficient_signal": true}` and we keep the previous batch visible instead of cycling in junk.
-- **JSON mode** so output is always parseable.
+## Context budget
 
-### Expand + chat prompts
+| Call        | Context passed                                                      |
+| ----------- | ------------------------------------------------------------------- |
+| transcribe  | Last ~900 chars of transcript (biases vocabulary)                   |
+| suggest     | Meeting type + rolling summary + last 2 batches' previews + live transcript window (default 3 min) |
+| expand      | Meeting type + full transcript + tapped suggestion (type/preview/angle) |
+| chat        | Meeting type + full transcript + full chat history + new user turn  |
+| summarize   | Meeting type + prior summary + the transcript slice being folded in |
 
-- **Expand** gets the full transcript (or a user-chosen window), the tapped suggestion, and a directive to answer directly, cite the transcript where relevant, stay under ~200 words, and admit uncertainty rather than fabricate. Streamed for fast TTFT.
-- **Chat** is the same pattern but with the running chat history instead of a single suggestion, so the conversation stays coherent.
+All window sizes are user-editable in Settings.
 
-## Improvements over the shipped TwinMind app
-
-Recurring failure modes observed using the real app — all addressed here:
-
-| Issue | Fix |
-|---|---|
-| Three near-duplicate "what is X" definition cards | Enforced type diversity per batch |
-| Same suggestion resurfaces 30s later | Pass prior batch previews; prompt forbids repeats |
-| Generic regardless of context | Meeting-type classification biases the mix |
-| Card requires a click to be useful | Preview-is-the-answer rule in the prompt |
-| Refresh fires on silence → junk cards | `insufficient_signal` flag keeps prior batch |
-| Unverified claims slide by | Explicit fact-check type with numeric/named trigger |
-| Slow feel on long answers | Expand + chat are token-streamed |
-
-## Settings (all editable, all with defaults)
-
-- Groq API key
-- Live suggestion / expand / chat prompts
-- Live context window (minutes)
-- Expand context window (minutes; 0 = full transcript)
-- Refresh interval (seconds) — also governs audio chunk length
-
-## Export
-
-One button → downloads a JSON file with `session_start`, every transcript chunk (timestamped), every suggestion batch (timestamped, with `clicked` booleans), and every chat message (timestamped, flagged if spawned from a suggestion).
-
-## Tradeoffs / what I'd do with more time
-
-- **Rolling summary** is wired through but not yet auto-generated. Would run a cheap summarization call every ~5 batches to keep the prompt small on hour-long meetings.
-- **Voice activity detection** client-side before spending a Whisper call on pure silence.
-- **Chunking with overlap** (2-3s tail between chunks) to avoid mid-word cuts — currently relying on Whisper's robustness, which is good enough in practice.
-- **Speaker diarization** would meaningfully improve "answer-a-question-just-asked" detection (we'd know *who* asked).
-- **Prompt eval harness** — record real meetings, run the suggest prompt over fixed windows, A/B new prompt versions against human-labeled gold batches. Where the next chunk of quality improvement lives.
-
-## Deploy
+## Local dev
 
 ```bash
-# From repo root:
-vercel
+npm install
+npm run dev
+# open http://localhost:3000
+# paste your Groq API key in Settings
+# click Start mic
 ```
 
-No env vars required — BYO API key, entered in-app.
+No `.env` needed. The key is supplied by the user at runtime. Serve over
+`localhost` or HTTPS — `getUserMedia` requires a secure context.
+
+## Deploying to Vercel
+
+1. Push this repo to GitHub (already done if you're reading this).
+2. Import it on [vercel.com/new](https://vercel.com/new). No env vars needed.
+3. Deploy.
+
+Route handlers use `runtime = "nodejs"` and `maxDuration` of 30–60s to cover
+long Whisper transcriptions and LLM streaming.
+
+## Stack
+
+- Next.js 16 (App Router, Turbopack) + React 19 + TypeScript
+- Tailwind v4 + lucide-react icons + react-markdown (assistant rendering)
+- Zustand (persisted settings + in-memory session)
+- `groq-sdk` server-side
+- Whisper Large V3 for ASR, `openai/gpt-oss-120b` for suggest/expand/chat/summarize
+
+## Project layout
+
+```
+app/
+  page.tsx                 main wiring (recorder, timers, suggest/expand/chat)
+  layout.tsx globals.css   fonts, dark theme
+  api/
+    transcribe/route.ts    Whisper call
+    suggest/route.ts       JSON-mode suggest
+    expand/route.ts        streamed detailed answer
+    chat/route.ts          streamed free chat
+    summarize/route.ts     rolling summary for long sessions
+components/
+  TranscriptColumn.tsx  SuggestionsColumn.tsx  ChatColumn.tsx
+  SettingsModal.tsx  Markdown.tsx
+lib/
+  recorder.ts    MediaRecorder chunking with stop() + flush()
+  api.ts         typed fetch wrappers
+  store.ts       Zustand stores (persisted settings, in-memory session)
+  prompts.ts     system prompts + DEFAULT_SETTINGS
+  context.ts     transcript windowing + previous-preview extraction
+  groq.ts        SDK client, auth header, shared error response
+  export.ts      JSON session dump
+  types.ts       shared types
+```
+
+## Latency
+
+Lightweight timing is logged to the console in dev:
+
+- `[latency] refresh→rendered` — click the Refresh button to suggestions drawn
+- `[latency] expand→first token` / `chat→first token` — click/send to first
+  streamed token

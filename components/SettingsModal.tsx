@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useState } from "react";
 import { useSettings } from "@/lib/store";
 import { DEFAULT_SETTINGS } from "@/lib/prompts";
 
@@ -11,14 +11,15 @@ export function SettingsModal({
   open: boolean;
   onClose: () => void;
 }) {
+  if (!open) return null;
+  return <SettingsModalBody onClose={onClose} />;
+}
+
+// Split body so `local` state is seeded fresh from settings on each open
+// (mount) — no useEffect-driven resync needed.
+function SettingsModalBody({ onClose }: { onClose: () => void }) {
   const { settings, setSettings, resetSettings } = useSettings();
   const [local, setLocal] = useState(settings);
-
-  useEffect(() => {
-    if (open) setLocal(settings);
-  }, [open, settings]);
-
-  if (!open) return null;
 
   const save = () => {
     setSettings(local);

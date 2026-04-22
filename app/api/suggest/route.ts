@@ -1,4 +1,4 @@
-import { getApiKey, groqClient, LLM_MODEL, missingKeyResponse } from "@/lib/groq";
+import { errorResponse, getApiKey, groqClient, LLM_MODEL, missingKeyResponse } from "@/lib/groq";
 
 export const runtime = "nodejs";
 export const maxDuration = 30;
@@ -48,7 +48,6 @@ export async function POST(req: Request) {
     const parsed = JSON.parse(raw);
     return Response.json(parsed);
   } catch (err) {
-    const message = err instanceof Error ? err.message : "Suggest failed";
-    return Response.json({ error: message }, { status: 500 });
+    return errorResponse(err, "Suggest failed");
   }
 }

@@ -19,3 +19,16 @@ export function missingKeyResponse() {
     { status: 401, headers: { "Content-Type": "application/json" } },
   );
 }
+
+// Translate a thrown Groq/SDK error into a JSON Response that preserves the
+// upstream status (401 invalid key, 429 rate-limited, etc.) so the client can
+// show a useful message instead of a generic 500.
+export function errorResponse(err: unknown, fallback: string) {
+  const e = err as { status?: number; message?: string };
+  const status =
+    typeof e?.status === "number" && e.status >= 400 && e.status < 600
+      ? e.status
+      : 500;
+  const message = e?.message || fallback;
+  return Response.json({ error: message }, { status });
+}
