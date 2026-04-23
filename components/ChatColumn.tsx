@@ -76,7 +76,11 @@ export function ChatColumn({
                 m.content ? (
                   <Markdown text={m.content} />
                 ) : (
-                  <div className="text-neutral-500">…</div>
+                  <div className="flex items-center gap-1 py-1">
+                    <span className="h-1.5 w-1.5 animate-pulse rounded-full bg-neutral-500 [animation-delay:0ms]" />
+                    <span className="h-1.5 w-1.5 animate-pulse rounded-full bg-neutral-500 [animation-delay:150ms]" />
+                    <span className="h-1.5 w-1.5 animate-pulse rounded-full bg-neutral-500 [animation-delay:300ms]" />
+                  </div>
                 )
               ) : (
                 <div className="whitespace-pre-wrap leading-relaxed">{m.content}</div>
@@ -102,7 +106,7 @@ export function ChatColumn({
           <button
             onClick={submit}
             disabled={isStreaming || !input.trim()}
-            className="rounded bg-white text-black px-3 py-2 text-sm font-medium disabled:opacity-40"
+            className="rounded bg-indigo-500 text-white px-3 py-2 text-sm font-medium transition hover:bg-indigo-600 disabled:opacity-40 disabled:hover:bg-indigo-500"
           >
             Send
           </button>
