@@ -77,6 +77,7 @@ export async function streamExpand(
     transcript: string;
     meetingType: string | null;
     suggestion: { type: string; preview: string; detail_seed?: string };
+    signal?: AbortSignal;
   },
   onDelta: (delta: string) => void,
 ): Promise<void> {
@@ -89,8 +90,9 @@ export async function streamExpand(
       meetingType: args.meetingType,
       suggestion: args.suggestion,
     }),
+    signal: args.signal,
   });
-  await readStream(res, onDelta);
+  await readStream(res, onDelta, args.signal);
 }
 
 export async function summarizeTranscript(args: {
@@ -123,28 +125,44 @@ export async function streamChat(
     transcript: string;
     meetingType: string | null;
     history: { role: "user" | "assistant"; content: string }[];
+    signal?: AbortSignal;
   },
   onDelta: (delta: string) => void,
 ): Promise<void> {
+  const { signal, apiKey, ...body } = args;
   const res = await fetch("/api/chat", {
     method: "POST",
-    headers: { ...authHeaders(args.apiKey), "Content-Type": "application/json" },
-    body: JSON.stringify(args),
+    headers: { ...authHeaders(apiKey), "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+    signal,
   });
-  await readStream(res, onDelta);
+  await readStream(res, onDelta, signal);
 }
 
-async function readStream(res: Response, onDelta: (d: string) => void) {
+async function readStream(
+  res: Response,
+  onDelta: (d: string) => void,
+  signal?: AbortSignal,
+) {
   if (!res.ok || !res.body) {
     const text = await res.text().catch(() => res.statusText);
     throw new Error(text || "Stream failed");
   }
   const reader = res.body.getReader();
   const decoder = new TextDecoder();
-  while (true) {
-    const { value, done } = await reader.read();
-    if (done) break;
-    const chunk = decoder.decode(value, { stream: true });
-    if (chunk) onDelta(chunk);
+  try {
+    while (true) {
+      if (signal?.aborted) {
+        await reader.cancel();
+        throw new DOMException("Aborted", "AbortError");
+      }
+      const { value, done } = await reader.read();
+      if (done) break;
+      const chunk = decoder.decode(value, { stream: true });
+      if (chunk) onDelta(chunk);
+    }
+  } catch (e) {
+    if (signal?.aborted) return; // clean cancel — swallow
+    throw e;
   }
 }

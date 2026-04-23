@@ -41,6 +41,7 @@ export default function Home() {
   // Index (exclusive) of the last transcript chunk folded into rollingSummary.
   const summarizedUpToRef = useRef<number>(0);
   const summarizingRef = useRef<boolean>(false);
+  const chatAbortRef = useRef<AbortController | null>(null);
 
   const sessionRef = useRef(session);
   const settingsRef = useRef(settings);
@@ -240,6 +241,9 @@ export default function Home() {
         timestamp: Date.now(),
       });
 
+      chatAbortRef.current?.abort();
+      const controller = new AbortController();
+      chatAbortRef.current = controller;
       setChatStreaming(true);
       const t0 = performance.now();
       let firstToken = true;
@@ -259,6 +263,7 @@ export default function Home() {
               preview: s.preview,
               detail_seed: s.detail_seed,
             },
+            signal: controller.signal,
           },
           (delta) => {
             if (firstToken) {
@@ -271,6 +276,7 @@ export default function Home() {
           },
         );
       } catch (e) {
+        if ((e as { name?: string })?.name === "AbortError") return;
         useSession
           .getState()
           .appendToChatMessage(
@@ -278,6 +284,7 @@ export default function Home() {
             `\n\n[error: ${e instanceof Error ? e.message : String(e)}]`,
           );
       } finally {
+        if (chatAbortRef.current === controller) chatAbortRef.current = null;
         setChatStreaming(false);
       }
     },
@@ -304,6 +311,9 @@ export default function Home() {
       content: "",
       timestamp: Date.now(),
     });
+    chatAbortRef.current?.abort();
+    const controller = new AbortController();
+    chatAbortRef.current = controller;
     setChatStreaming(true);
     const t0 = performance.now();
     let firstToken = true;
@@ -323,6 +333,7 @@ export default function Home() {
           transcript,
           meetingType: sessionRef.current.meetingType,
           history,
+          signal: controller.signal,
         },
         (delta) => {
           if (firstToken) {
@@ -335,6 +346,7 @@ export default function Home() {
         },
       );
     } catch (e) {
+      if ((e as { name?: string })?.name === "AbortError") return;
       useSession
         .getState()
         .appendToChatMessage(
@@ -342,6 +354,7 @@ export default function Home() {
           `\n\n[error: ${e instanceof Error ? e.message : String(e)}]`,
         );
     } finally {
+      if (chatAbortRef.current === controller) chatAbortRef.current = null;
       setChatStreaming(false);
     }
   }, []);
