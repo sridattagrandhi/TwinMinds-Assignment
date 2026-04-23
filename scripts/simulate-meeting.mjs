@@ -14,6 +14,9 @@ import { SUGGEST_PROMPT, EXPAND_PROMPT, CHAT_PROMPT } from "../lib/prompts.ts";
 
 const KEY = process.env.GROQ_API_KEY;
 const BASE = process.env.BASE_URL || "http://localhost:3000";
+// Pause between suggest calls. Default mirrors the real app's 30s cadence;
+// set to 0 to hammer back-to-back (useful for stress-testing rate limits).
+const PACE_MS = Number(process.env.PACE_MS ?? 3000);
 
 if (!KEY) {
   console.error("Set GROQ_API_KEY to run this script.");
@@ -142,6 +145,10 @@ async function main() {
     transcribed.push(CHUNKS[i]);
 
     if ((i + 1) % CHUNKS_PER_SUGGEST !== 0) continue;
+
+    if (batches.length > 0 && PACE_MS > 0) {
+      await new Promise((r) => setTimeout(r, PACE_MS));
+    }
 
     // Suggest
     const recent = transcriptTail(transcribed, 3);
